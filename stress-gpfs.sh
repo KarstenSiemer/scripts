@@ -2,7 +2,7 @@
 
 usage(){
     cat <<'EOF'
-Usage: stress.sh [CPUS] [DURATION] [GPFS_WORKERS] [MEM_MB]
+Usage: stress.sh [CPUS] [DURATION] [GPFS_WORKERS] [MEM_MB] [MEM_MODE]
 
   CPUS          Number of CPU burn workers          (default: 8, 0 to disable)
   DURATION      Test duration in seconds             (default: 300)
@@ -14,16 +14,23 @@ Usage: stress.sh [CPUS] [DURATION] [GPFS_WORKERS] [MEM_MB]
                   - metadata storm       (500-file batches, deep dirs)
                   - hardlink/symlink     (200 link create/stat/delete)
                   - 1 sequential writer  (256MB bulk writes)
-  MEM_MB        Memory to allocate and hold (MB)     (default: 4096, 0 to disable)
+  MEM_MB        Memory amount in MB                  (default: 4096, 0 to disable)
+                In static mode: total MB to allocate and hold.
+                In leak mode: MB to allocate PER SECOND until OOM.
                 Requires python3 in PATH.
+  MEM_MODE      "static" or "leak"                   (default: static)
+                static = allocate MEM_MB once and hold it.
+                leak   = allocate MEM_MB every second, growing until OOM.
+                WARNING: leak mode WILL trigger the OOM killer.
 
 Examples:
-  stress.sh                     # defaults: 8 CPU, 300s, 4 GPFS, 4096MB mem
-  stress.sh 16 600 8 8192       # heavy: 16 CPU, 10min, 8 GPFS workers, 8GB mem
-  stress.sh 0 300 4 0           # GPFS stress only, no CPU burn, no memory
-  stress.sh 8 300 0 0           # CPU burn only, no GPFS, no memory
-  stress.sh 0 300 0 4096        # memory drain only
-  stress.sh 4 120 2 2048        # light: 4 CPU, 2min, 2 GPFS workers, 2GB mem
+  stress.sh                          # defaults: 8 CPU, 300s, 4 GPFS, 4096MB static
+  stress.sh 16 600 8 8192 static     # heavy: 16 CPU, 10min, 8 GPFS, 8GB static
+  stress.sh 8 300 4 100 leak         # leak 100MB/sec until OOM + full stress
+  stress.sh 0 300 0 500 leak         # pure memory leak only, 500MB/sec
+  stress.sh 0 300 4 0                # GPFS stress only, no CPU burn, no memory
+  stress.sh 8 300 0 0                # CPU burn only, no GPFS, no memory
+  stress.sh 4 120 2 2048 static      # light: 4 CPU, 2min, 2 GPFS workers, 2GB static
 
 Monitoring (run in separate terminals):
   watch -n2 'mmdiag --tokenmgr'   # token revocations (GPFS CPU indicator)
@@ -41,6 +48,7 @@ CPUS=${1:-8}
 TIMEOUT_SECS=${2:-300}
 GPFS_WORKERS=${3:-4}
 MEM_MB=${4:-4096}
+MEM_MODE=${5:-static}  # "static" = allocate and hold, "leak" = grow until OOM
 DISK_DIR="/tmp/stress"
 
 worker_pids=""
@@ -70,13 +78,27 @@ fi
 # --- Memory drain ---
 if [ "$MEM_MB" -gt 0 ]; then
     if command -v python3 > /dev/null 2>&1; then
-        mem_bytes=$((MEM_MB * 1024 * 1024))
-        python3 -c "
+        if [ "$MEM_MODE" = "leak" ]; then
+            # Grow MEM_MB per second until OOM killer fires
+            chunk=$((MEM_MB * 1024 * 1024))
+            python3 -c "
+import time
+x = []
+while True:
+    x.append(b'\x00' * ${chunk})
+    time.sleep(1)
+" &
+            worker_pids="$worker_pids $!"
+            mem_status="LEAK MODE (${MEM_MB}MB/sec until OOM)"
+        else
+            mem_bytes=$((MEM_MB * 1024 * 1024))
+            python3 -c "
 x = b'\x00' * ${mem_bytes}
 import time; time.sleep(${TIMEOUT_SECS} + 10)
 " &
-        worker_pids="$worker_pids $!"
-        mem_status="python3 (${MEM_MB}MB allocated)"
+            worker_pids="$worker_pids $!"
+            mem_status="static (${MEM_MB}MB allocated)"
+        fi
     else
         printf 'WARNING: python3 not found, skipping memory stress\n'
         mem_status="skipped (no python3)"
